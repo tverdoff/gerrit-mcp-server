@@ -651,12 +651,15 @@ async def list_change_comments(
         output += f"---\nFile: {file_path}\n"
         found_comments = True
         for comment in comments:
+            comment_id = comment.get("id", "?")
             line = comment.get("line", "File")
             author = comment.get("author", {}).get("name", "Unknown")
             timestamp = comment.get("updated", "No date")
             message = comment["message"]
             status = "UNRESOLVED" if comment.get("unresolved", False) else "RESOLVED"
-            output += f"L{line}: [{author}] ({timestamp}) - {status}\n"
+            in_reply_to = comment.get("in_reply_to", "")
+            reply_info = f" (reply to {in_reply_to})" if in_reply_to else ""
+            output += f"[{comment_id}] L{line}: [{author}] ({timestamp}) - {status}{reply_info}\n"
             output += f"  {message}\n"
 
     if not found_comments:
@@ -1266,6 +1269,36 @@ async def get_bugs_from_cl(
     ]
 
 
+async def _fetch_parent_comment_range(
+    base_url: str, change_id: str, parent_id: str
+) -> Optional[Dict[str, Any]]:
+    """Fetch the range of a parent comment by ID, checking both published comments and drafts."""
+    try:
+        # Check published comments first
+        comments_url = f"{base_url}/changes/{change_id}/comments"
+        comments_str = await run_curl([comments_url], base_url)
+        all_comments = json.loads(comments_str)
+        for _fp, file_comments in all_comments.items():
+            for c in file_comments:
+                if c.get("id") == parent_id and "range" in c:
+                    return c["range"]
+
+        # Fallback: check drafts
+        drafts_url = f"{base_url}/changes/{change_id}/revisions/current/drafts"
+        drafts_str = await run_curl([drafts_url], base_url)
+        all_drafts = json.loads(drafts_str)
+        for _fp, file_drafts in all_drafts.items():
+            for d in file_drafts:
+                if d.get("id") == parent_id and "range" in d:
+                    return d["range"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        with open(LOG_FILE_PATH, "a") as log_file:
+            log_file.write(
+                f"[gerrit-mcp-server] Error fetching parent comment range for {parent_id} on CL {change_id}: {e}\n"
+            )
+    return None
+
+
 @mcp.tool()
 async def post_review_comment(
     change_id: str,
@@ -1275,24 +1308,34 @@ async def post_review_comment(
     unresolved: bool = True,
     gerrit_base_url: Optional[str] = None,
     labels: Optional[Dict[str, int]] = None,
+    in_reply_to: Optional[str] = None,
 ):
     """
     Posts a review comment on a specific line of a file in a CL.
+
+    Use in_reply_to with a comment ID to reply to an existing comment thread.
+    Comment IDs can be obtained from list_change_comments or list_draft_comments.
     """
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
     base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
     url = f"{base_url}/changes/{change_id}/revisions/current/review"
 
-    payload = {
+    comment_entry: Dict[str, Any] = {
+        "line": line_number,
+        "message": message,
+        "unresolved": unresolved,
+    }
+    if in_reply_to is not None:
+        comment_entry["in_reply_to"] = in_reply_to
+        parent_range = await _fetch_parent_comment_range(base_url, change_id, in_reply_to)
+        if parent_range is not None:
+            comment_entry["range"] = parent_range
+            comment_entry["line"] = parent_range.get("end_line", line_number)
+
+    payload: Dict[str, Any] = {
         "comments": {
-            file_path: [
-                {
-                    "line": line_number,
-                    "message": message,
-                    "unresolved": unresolved,
-                }
-            ]
+            file_path: [comment_entry]
         },
     }
     if labels:
@@ -1338,11 +1381,14 @@ async def post_draft_comment(
     end_line: Optional[int] = None,
     end_character: Optional[int] = None,
     suggestion: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
 ):
     """
     Creates a draft review comment on a specific line of a file in a CL.
     Draft comments are only visible to the author until explicitly published.
 
+    Use in_reply_to with a comment ID to reply to an existing comment thread.
+    Comment IDs can be obtained from list_change_comments or list_draft_comments.
     """
     if suggestion is not None:
         message = message + f"\n```suggestion\n{suggestion}\n```"
@@ -1358,6 +1404,14 @@ async def post_draft_comment(
         "message": message,
         "unresolved": unresolved,
     }
+
+    if in_reply_to is not None:
+        payload["in_reply_to"] = in_reply_to
+        if not all(v is not None for v in [start_line, start_character, end_line, end_character]):
+            parent_range = await _fetch_parent_comment_range(base_url, change_id, in_reply_to)
+            if parent_range is not None:
+                payload["range"] = parent_range
+                payload["line"] = parent_range.get("end_line", line_number)
 
     if all(v is not None for v in [start_line, start_character, end_line, end_character]):
         payload["range"] = {
@@ -1502,58 +1556,6 @@ async def delete_draft_comments(
     return [{"type": "text", "text": output}]
 
 
-@mcp.tool()
-async def post_draft_comment(
-    change_id: str,
-    file_path: str,
-    line_number: int,
-    message: str,
-    unresolved: bool = True,
-    gerrit_base_url: Optional[str] = None,
-):
-    """
-    Creates a draft comment on a specific line of a file in a CL.
-    Draft comments are only visible to the author and must be manually
-    published from the Gerrit UI. Use this instead of post_review_comment
-    when you want to review comments before publishing.
-    """
-    config = load_gerrit_config()
-    gerrit_hosts = config.get("gerrit_hosts", [])
-    base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = f"{base_url}/changes/{change_id}/revisions/current/drafts"
-
-    payload = {
-        "path": file_path,
-        "line": line_number,
-        "message": message,
-        "unresolved": unresolved,
-    }
-
-    args = _create_put_args(url, payload)
-
-    try:
-        result_str = await run_curl(args, base_url)
-        result = json.loads(result_str)
-        if "id" in result:
-            return [
-                {
-                    "type": "text",
-                    "text": f"Successfully created draft comment on CL {change_id}, file {file_path} at line {line_number}. Draft ID: {result['id']}. Publish it from the Gerrit UI when ready.",
-                }
-            ]
-        else:
-            return [
-                {
-                    "type": "text",
-                    "text": f"Unexpected response when creating draft. Response: {result_str}",
-                }
-            ]
-    except Exception as e:
-        with open(LOG_FILE_PATH, "a") as log_file:
-            log_file.write(
-                f"[gerrit-mcp-server] Error creating draft comment on CL {change_id}: {e}\n"
-            )
-        raise e
 
 
 
