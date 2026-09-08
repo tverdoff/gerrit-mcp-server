@@ -11,7 +11,11 @@ class TestPostDraftComment(unittest.TestCase):
     @patch("gerrit_mcp_server.main.run_curl", new_callable=AsyncMock)
     def test_post_draft_comment_success(self, mock_run_curl):
         async def run_test():
-            mock_run_curl.return_value = json.dumps({"id": "draft-abc123"})
+            # First call lists existing drafts (none), second creates the draft.
+            mock_run_curl.side_effect = [
+                json.dumps({}),
+                json.dumps({"id": "draft-abc123"}),
+            ]
 
             result = await main.post_draft_comment(
                 change_id="456",
@@ -24,7 +28,7 @@ class TestPostDraftComment(unittest.TestCase):
             self.assertIn("Draft comment created on CL 456", result[0]["text"])
             self.assertIn("src/main.py", result[0]["text"])
 
-            mock_run_curl.assert_called_once()
+            # The create call is the one carrying --data (last of the two).
             args, kwargs = mock_run_curl.call_args
             curl_args = args[0]
             payload = json.loads(curl_args[curl_args.index("--data") + 1])
@@ -98,6 +102,7 @@ class TestPostDraftComment(unittest.TestCase):
             }
             mock_run_curl.side_effect = [
                 json.dumps(parent_comments),   # resolve parent anchor
+                json.dumps({}),                # no existing draft in the thread
                 json.dumps({"id": "draft-reply-1"}),  # create
             ]
 
@@ -124,6 +129,47 @@ class TestPostDraftComment(unittest.TestCase):
             self.assertEqual(payload["in_reply_to"], "parent-1")
             # It inherits the parent's line so it nests instead of detaching.
             self.assertEqual(payload["line"], 46)
+
+        asyncio.run(run_test())
+
+    @patch("gerrit_mcp_server.main.run_curl", new_callable=AsyncMock)
+    def test_post_draft_reply_replaces_existing_thread_draft(self, mock_run_curl):
+        async def run_test():
+            parent_comments = {
+                "src/main.py": [{"id": "parent-1", "patch_set": 4, "line": 46}]
+            }
+            existing_drafts = {
+                "src/main.py": [
+                    {"id": "old-draft-1", "in_reply_to": "parent-1", "line": 46}
+                ]
+            }
+            mock_run_curl.side_effect = [
+                json.dumps(parent_comments),   # resolve parent anchor
+                json.dumps(existing_drafts),   # a draft is already in this thread
+                "",                            # delete the existing draft
+                json.dumps({"id": "new-draft-1"}),  # repost
+            ]
+
+            result = await main.post_draft_comment(
+                change_id="456",
+                file_path="src/main.py",
+                line_number=99,
+                message="reply",
+                in_reply_to="parent-1",
+                gerrit_base_url="https://gerrit-review.googlesource.com",
+            )
+
+            # The user is told the stack was avoided by delete + repost.
+            self.assertIn("Replaced an existing draft", result[0]["text"])
+            self.assertIn("old-draft-1", result[0]["text"])
+
+            # A DELETE was issued against the existing draft before the repost.
+            delete_call = next(
+                c
+                for c in mock_run_curl.call_args_list
+                if "DELETE" in c.args[0]
+            )
+            self.assertIn("drafts/old-draft-1", "".join(delete_call.args[0]))
 
         asyncio.run(run_test())
 

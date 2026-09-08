@@ -1318,6 +1318,50 @@ async def _fetch_parent_comment_anchor(
     return None
 
 
+async def _find_existing_thread_draft(
+    base_url: str,
+    change_id: str,
+    revision: str,
+    file_path: str,
+    in_reply_to: Optional[str],
+    line: Optional[int],
+) -> Optional[str]:
+    """Return the id of an existing own draft in the same thread, else None.
+
+    Gerrit permits more than one draft in a thread, but stacking two is never what
+    a reply is meant to do - the second just hides behind the first until one is
+    discarded. So a draft that would land in a thread already holding one of your
+    drafts replaces it (the caller deletes and reposts) rather than piling on. A
+    reply thread is matched by its reply target; a non-reply draft by file and line.
+    """
+    try:
+        drafts_url = f"{base_url}/changes/{change_id}/revisions/{revision}/drafts"
+        drafts_str = await run_curl([drafts_url], base_url)
+        all_drafts = json.loads(drafts_str)
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        with open(LOG_FILE_PATH, "a") as log_file:
+            log_file.write(
+                f"[gerrit-mcp-server] Error listing drafts while checking for an existing one on CL {change_id}: {e}\n"
+            )
+        return None
+
+    for path, file_drafts in all_drafts.items():
+        for d in file_drafts:
+            if in_reply_to is not None:
+                # Same thread: a draft replying to the same parent, or the parent
+                # draft itself when replying directly to one's own draft.
+                if d.get("in_reply_to") == in_reply_to or d.get("id") == in_reply_to:
+                    return d.get("id")
+            elif (
+                path == file_path
+                and not d.get("in_reply_to")
+                and d.get("line") == line
+            ):
+                # Non-reply: an own top-level draft already at this file and line.
+                return d.get("id")
+    return None
+
+
 @mcp.tool()
 async def post_review_comment(
     change_id: str,
@@ -1469,16 +1513,37 @@ async def post_draft_comment(
         # Gerrit requires line to equal end_line when a range is provided.
         payload["line"] = end_line
 
+    # Never stack two drafts in one thread. If one is already there, delete it and
+    # repost so the thread keeps a single draft, and tell the caller it happened.
+    replaced_id = await _find_existing_thread_draft(
+        base_url, change_id, revision, file_path, in_reply_to, payload.get("line")
+    )
+    if replaced_id is not None:
+        delete_url = f"{base_url}/changes/{change_id}/revisions/{revision}/drafts/{replaced_id}"
+        try:
+            await run_curl(_create_delete_args(delete_url), base_url)
+        except Exception as e:
+            with open(LOG_FILE_PATH, "a") as log_file:
+                log_file.write(
+                    f"[gerrit-mcp-server] Error deleting existing draft {replaced_id} before repost on CL {change_id}: {e}\n"
+                )
+            raise e
+
     args = _create_put_args(url, payload)
 
     try:
         result_str = await run_curl(args, base_url)
         result = json.loads(result_str)
         if "id" in result:
+            replaced_note = (
+                f" Replaced an existing draft ({replaced_id}) already in this thread (delete + repost)."
+                if replaced_id is not None
+                else ""
+            )
             return [
                 {
                     "type": "text",
-                    "text": f"Draft comment created on CL {change_id}, file {file_path} at line {line_number}.",
+                    "text": f"Draft comment created on CL {change_id}, file {file_path} at line {line_number}.{replaced_note}",
                 }
             ]
         else:
