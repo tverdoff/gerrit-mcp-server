@@ -89,6 +89,45 @@ class TestPostDraftComment(unittest.TestCase):
         asyncio.run(run_test())
 
     @patch("gerrit_mcp_server.main.run_curl", new_callable=AsyncMock)
+    def test_post_draft_reply_uses_parent_patch_set(self, mock_run_curl):
+        async def run_test():
+            # First call resolves the parent (published on patch set 4, line 46);
+            # second call creates the draft.
+            parent_comments = {
+                "src/main.py": [{"id": "parent-1", "patch_set": 4, "line": 46}]
+            }
+            mock_run_curl.side_effect = [
+                json.dumps(parent_comments),   # resolve parent anchor
+                json.dumps({"id": "draft-reply-1"}),  # create
+            ]
+
+            result = await main.post_draft_comment(
+                change_id="456",
+                file_path="src/main.py",
+                line_number=99,
+                message="reply",
+                in_reply_to="parent-1",
+                gerrit_base_url="https://gerrit-review.googlesource.com",
+            )
+
+            self.assertIn("Draft comment created", result[0]["text"])
+
+            # The create call is the one carrying --data.
+            create_call = next(
+                c for c in mock_run_curl.call_args_list if "--data" in c.args[0]
+            )
+            curl_args = create_call.args[0]
+            url = next(a for a in curl_args if "/changes/456/revisions/" in a)
+            # The reply must be created on the parent's patch set, not "current".
+            self.assertIn("/revisions/4/drafts", url)
+            payload = json.loads(curl_args[curl_args.index("--data") + 1])
+            self.assertEqual(payload["in_reply_to"], "parent-1")
+            # It inherits the parent's line so it nests instead of detaching.
+            self.assertEqual(payload["line"], 46)
+
+        asyncio.run(run_test())
+
+    @patch("gerrit_mcp_server.main.run_curl", new_callable=AsyncMock)
     def test_post_draft_comment_no_id_in_response(self, mock_run_curl):
         async def run_test():
             mock_run_curl.return_value = json.dumps({"error": "something"})

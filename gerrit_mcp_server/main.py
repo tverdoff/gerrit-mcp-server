@@ -1269,32 +1269,51 @@ async def get_bugs_from_cl(
     ]
 
 
-async def _fetch_parent_comment_range(
+async def _fetch_parent_comment_anchor(
     base_url: str, change_id: str, parent_id: str
 ) -> Optional[Dict[str, Any]]:
-    """Fetch the range of a parent comment by ID, checking both published comments and drafts."""
+    """Fetch the anchor of a parent comment by ID, checking published comments then drafts.
+
+    A reply must be created on the same patch set as its parent and carry the same
+    line/range/side, or Gerrit both links it into the thread and draws it as a
+    separate comment on the current patch set. So this returns the parent's
+    ``patch_set``, ``line``, ``range`` and ``side`` when present, not only its range.
+    """
+    def _extract(comment: Dict[str, Any]) -> Dict[str, Any]:
+        anchor: Dict[str, Any] = {}
+        for key in ("patch_set", "line", "range"):
+            if comment.get(key) is not None:
+                anchor[key] = comment[key]
+        # side is only present for left-hand (base) comments; omit it otherwise so
+        # the reply defaults to the revision side, like the parent did.
+        if comment.get("side"):
+            anchor["side"] = comment["side"]
+        return anchor
+
     try:
-        # Check published comments first
+        # Published comments carry patch_set; check them first.
         comments_url = f"{base_url}/changes/{change_id}/comments"
         comments_str = await run_curl([comments_url], base_url)
         all_comments = json.loads(comments_str)
         for _fp, file_comments in all_comments.items():
             for c in file_comments:
-                if c.get("id") == parent_id and "range" in c:
-                    return c["range"]
+                if c.get("id") == parent_id:
+                    return _extract(c)
 
-        # Fallback: check drafts
+        # Fallback: an unpublished draft parent. The drafts endpoint is per-revision
+        # and omits patch_set; leaving it unset makes the reply default to the
+        # current patch set, which is where a current-revision draft lives anyway.
         drafts_url = f"{base_url}/changes/{change_id}/revisions/current/drafts"
         drafts_str = await run_curl([drafts_url], base_url)
         all_drafts = json.loads(drafts_str)
         for _fp, file_drafts in all_drafts.items():
             for d in file_drafts:
-                if d.get("id") == parent_id and "range" in d:
-                    return d["range"]
+                if d.get("id") == parent_id:
+                    return _extract(d)
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         with open(LOG_FILE_PATH, "a") as log_file:
             log_file.write(
-                f"[gerrit-mcp-server] Error fetching parent comment range for {parent_id} on CL {change_id}: {e}\n"
+                f"[gerrit-mcp-server] Error fetching parent comment anchor for {parent_id} on CL {change_id}: {e}\n"
             )
     return None
 
@@ -1319,19 +1338,30 @@ async def post_review_comment(
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
     base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = f"{base_url}/changes/{change_id}/revisions/current/review"
 
     comment_entry: Dict[str, Any] = {
         "line": line_number,
         "message": message,
         "unresolved": unresolved,
     }
+    # A reply is posted against the patch set its parent lives on, defaulting to the
+    # current one when there is no parent or it cannot be resolved.
+    revision = "current"
     if in_reply_to is not None:
         comment_entry["in_reply_to"] = in_reply_to
-        parent_range = await _fetch_parent_comment_range(base_url, change_id, in_reply_to)
-        if parent_range is not None:
-            comment_entry["range"] = parent_range
-            comment_entry["line"] = parent_range.get("end_line", line_number)
+        parent_anchor = await _fetch_parent_comment_anchor(base_url, change_id, in_reply_to)
+        if parent_anchor is not None:
+            if parent_anchor.get("patch_set") is not None:
+                revision = str(parent_anchor["patch_set"])
+            if "range" in parent_anchor:
+                comment_entry["range"] = parent_anchor["range"]
+                comment_entry["line"] = parent_anchor["range"].get("end_line", line_number)
+            elif "line" in parent_anchor:
+                comment_entry["line"] = parent_anchor["line"]
+            if parent_anchor.get("side"):
+                comment_entry["side"] = parent_anchor["side"]
+
+    url = f"{base_url}/changes/{change_id}/revisions/{revision}/review"
 
     payload: Dict[str, Any] = {
         "comments": {
@@ -1396,7 +1426,6 @@ async def post_draft_comment(
     config = load_gerrit_config()
     gerrit_hosts = config.get("gerrit_hosts", [])
     base_url = _normalize_gerrit_url(_get_gerrit_base_url(gerrit_base_url), gerrit_hosts)
-    url = f"{base_url}/changes/{change_id}/revisions/current/drafts"
 
     payload: Dict[str, Any] = {
         "path": file_path,
@@ -1405,15 +1434,32 @@ async def post_draft_comment(
         "unresolved": unresolved,
     }
 
+    # A reply is created against the patch set its parent lives on, defaulting to
+    # the current one when there is no parent or it cannot be resolved. Posting a
+    # reply on a different patch set than its parent makes Gerrit draw it both in
+    # the thread and as a stray comment on that patch set.
+    revision = "current"
+    caller_supplied_range = all(
+        v is not None for v in [start_line, start_character, end_line, end_character]
+    )
     if in_reply_to is not None:
         payload["in_reply_to"] = in_reply_to
-        if not all(v is not None for v in [start_line, start_character, end_line, end_character]):
-            parent_range = await _fetch_parent_comment_range(base_url, change_id, in_reply_to)
-            if parent_range is not None:
-                payload["range"] = parent_range
-                payload["line"] = parent_range.get("end_line", line_number)
+        parent_anchor = await _fetch_parent_comment_anchor(base_url, change_id, in_reply_to)
+        if parent_anchor is not None:
+            if parent_anchor.get("patch_set") is not None:
+                revision = str(parent_anchor["patch_set"])
+            if not caller_supplied_range:
+                if "range" in parent_anchor:
+                    payload["range"] = parent_anchor["range"]
+                    payload["line"] = parent_anchor["range"].get("end_line", line_number)
+                elif "line" in parent_anchor:
+                    payload["line"] = parent_anchor["line"]
+                if parent_anchor.get("side"):
+                    payload["side"] = parent_anchor["side"]
 
-    if all(v is not None for v in [start_line, start_character, end_line, end_character]):
+    url = f"{base_url}/changes/{change_id}/revisions/{revision}/drafts"
+
+    if caller_supplied_range:
         payload["range"] = {
             "start_line": start_line,
             "start_character": start_character,
